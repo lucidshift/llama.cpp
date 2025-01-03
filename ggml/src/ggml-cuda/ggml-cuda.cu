@@ -301,7 +301,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 // pool with virtual memory
 #if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
-    static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+    static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 34; // 16 GB
 
     int device;
     CUdeviceptr pool_addr = 0;
