@@ -2,9 +2,12 @@
 #undef NDEBUG
 #endif
 
-#include "unicode.h"
-#include "llama-grammar.h"
 #include "json-schema-to-grammar.h"
+
+#include "../src/unicode.h"
+#include "../src/llama-grammar.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cassert>
 #include <string>
@@ -296,6 +299,30 @@ static void test_simple_grammar() {
             "31",
             "123",
             "0123",
+        }
+    );
+    test_schema(
+        "min 1 max 900719925474091",
+        // Schema
+        R"""({
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 900719925474091
+        })""",
+        // Passing strings
+        {
+            "1",
+            "2",
+            "10",
+            "900719925474090",
+            "900719925474091",
+        },
+        // Failing strings
+        {
+            "0",
+            "01",
+            "900719925474092",
+            "9007199254740910",
         }
     );
     test_schema(

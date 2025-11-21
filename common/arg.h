@@ -59,8 +59,8 @@ struct common_arg {
     common_arg & set_sparam();
     bool in_example(enum llama_example ex);
     bool is_exclude(enum llama_example ex);
-    bool get_value_from_env(std::string & output);
-    bool has_value_from_env();
+    bool get_value_from_env(std::string & output) const;
+    bool has_value_from_env() const;
     std::string to_string();
 };
 
@@ -78,3 +78,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
 
 // function to be used by test-arg-parser
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **) = nullptr);
+
+struct common_remote_params {
+    std::vector<std::string> headers;
+    long timeout = 0; // CURLOPT_TIMEOUT, in seconds ; 0 means no timeout
+    long max_size = 0; // max size of the response ; unlimited if 0 ; max is 2GB
+};
+// get remote file content, returns <http_code, raw_response_body>
+std::pair<long, std::vector<char>> common_remote_get_content(const std::string & url, const common_remote_params & params);
