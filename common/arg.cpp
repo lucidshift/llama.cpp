@@ -30,6 +30,7 @@
 #include <thread> // for hardware_concurrency
 #include <vector>
 
+#ifndef __EMSCRIPTEN__
 #ifdef __linux__
 #include <linux/limits.h>
 #elif defined(_WIN32)
@@ -41,6 +42,8 @@
 #else
 #include <sys/syslimits.h>
 #endif
+#endif
+
 #define LLAMA_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
 
 using json = nlohmann::ordered_json;
@@ -212,13 +215,13 @@ struct handle_model_result {
 static handle_model_result common_params_handle_model(
         struct common_params_model & model,
         const std::string & bearer_token,
-        const std::string & model_path_default,
         bool offline) {
     handle_model_result result;
     // handle pre-fill default model path and url based on hf_repo and hf_file
     {
         if (!model.docker_repo.empty()) {  // Handle Docker URLs by resolving them to local paths
             model.path = common_docker_resolve_model(model.docker_repo);
+            model.name = model.docker_repo; // set name for consistency
         } else if (!model.hf_repo.empty()) {
             // short-hand to avoid specifying --hf-file -> default it to --model
             if (model.hf_file.empty()) {
@@ -227,7 +230,8 @@ static handle_model_result common_params_handle_model(
                     if (auto_detected.repo.empty() || auto_detected.ggufFile.empty()) {
                         exit(1); // built without CURL, error message already printed
                     }
-                    model.hf_repo = auto_detected.repo;
+                    model.name    = model.hf_repo;      // repo name with tag
+                    model.hf_repo = auto_detected.repo; // repo name without tag
                     model.hf_file = auto_detected.ggufFile;
                     if (!auto_detected.mmprojFile.empty()) {
                         result.found_mmproj   = true;
@@ -257,8 +261,6 @@ static handle_model_result common_params_handle_model(
                 model.path = fs_get_cache_file(string_split<std::string>(f, '/').back());
             }
 
-        } else if (model.path.empty()) {
-            model.path = model_path_default;
         }
     }
 
@@ -405,7 +407,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // handle model and download
     {
-        auto res = common_params_handle_model(params.model, params.hf_token, DEFAULT_MODEL_PATH, params.offline);
+        auto res = common_params_handle_model(params.model, params.hf_token, params.offline);
         if (params.no_mmproj) {
             params.mmproj = {};
         } else if (res.found_mmproj && params.mmproj.path.empty() && params.mmproj.url.empty()) {
@@ -415,12 +417,18 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // only download mmproj if the current example is using it
         for (auto & ex : mmproj_examples) {
             if (ctx_arg.ex == ex) {
-                common_params_handle_model(params.mmproj,    params.hf_token, "", params.offline);
+                common_params_handle_model(params.mmproj,    params.hf_token, params.offline);
                 break;
             }
         }
-        common_params_handle_model(params.speculative.model, params.hf_token, "", params.offline);
-        common_params_handle_model(params.vocoder.model,     params.hf_token, "", params.offline);
+        common_params_handle_model(params.speculative.model, params.hf_token, params.offline);
+        common_params_handle_model(params.vocoder.model,     params.hf_token, params.offline);
+    }
+
+    // model is required (except for server)
+    // TODO @ngxson : maybe show a list of available models in CLI in this case
+    if (params.model.path.empty() && ctx_arg.ex != LLAMA_EXAMPLE_SERVER && !params.usage) {
+        throw std::invalid_argument("error: --model is required\n");
     }
 
     if (params.escape) {
@@ -694,6 +702,14 @@ static bool is_autoy(const std::string & value) {
 }
 
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    // default values specific to example
+    // note: we place it here instead of inside server.cpp to allow llama-gen-docs to pick it up
+    if (ex == LLAMA_EXAMPLE_SERVER) {
+        params.use_jinja = true;
+    }
+
+    params.use_color = tty_can_use_colors();
+
     // load dynamic backends
     ggml_backend_load_all();
 
@@ -776,10 +792,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
-        {"-co", "--color"},
-        string_format("colorise output to distinguish prompt and user input from generations (default: %s)", params.use_color ? "true" : "false"),
-        [](common_params & params) {
-            params.use_color = true;
+        {"-co", "--color"}, "[on|off|auto]",
+        "Colorize output to distinguish prompt and user input from generations ('on', 'off', or 'auto', default: 'auto')\n"
+        "'auto' enables colors when output is to a terminal",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.use_color = true;
+            } else if (is_falsey(value)) {
+                params.use_color = false;
+            } else if (is_autoy(value)) {
+                params.use_color = tty_can_use_colors();
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --color: '%s'\n", value.c_str()));
+            }
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
     add_opt(common_arg(
@@ -974,7 +1000,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.kv_unified = true;
         }
-    ).set_env("LLAMA_ARG_KV_SPLIT"));
+    ).set_env("LLAMA_ARG_KV_UNIFIED"));
     add_opt(common_arg(
         {"--no-context-shift"},
         string_format("disables context shift on infinite text generation (default: %s)", params.ctx_shift ? "disabled" : "enabled"),
@@ -1008,7 +1034,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
                            } else {
                                throw std::runtime_error(
-                                   string_format("error: unkown value for --flash-attn: '%s'\n", value.c_str()));
+                                   string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(common_arg(
@@ -1215,7 +1241,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.warmup = false;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--spm-infill"},
         string_format(
@@ -1232,6 +1258,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             const auto sampler_names = string_split<std::string>(value, ';');
             params.sampling.samplers = common_sampler_types_from_names(sampler_names, true);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1261,6 +1288,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.sampling.temp = std::stof(value);
             params.sampling.temp = std::max(params.sampling.temp, 0.0f);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1268,6 +1296,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("top-k sampling (default: %d, 0 = disabled)", params.sampling.top_k),
         [](common_params & params, int value) {
             params.sampling.top_k = value;
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1275,6 +1304,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("top-p sampling (default: %.1f, 1.0 = disabled)", (double)params.sampling.top_p),
         [](common_params & params, const std::string & value) {
             params.sampling.top_p = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1282,6 +1312,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("min-p sampling (default: %.1f, 0.0 = disabled)", (double)params.sampling.min_p),
         [](common_params & params, const std::string & value) {
             params.sampling.min_p = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1296,6 +1327,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("xtc probability (default: %.1f, 0.0 = disabled)", (double)params.sampling.xtc_probability),
         [](common_params & params, const std::string & value) {
             params.sampling.xtc_probability = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1303,6 +1335,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("xtc threshold (default: %.1f, 1.0 = disabled)", (double)params.sampling.xtc_threshold),
         [](common_params & params, const std::string & value) {
             params.sampling.xtc_threshold = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1321,6 +1354,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.sampling.penalty_last_n = value;
             params.sampling.n_prev = std::max(params.sampling.n_prev, params.sampling.penalty_last_n);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1328,6 +1362,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("penalize repeat sequence of tokens (default: %.1f, 1.0 = disabled)", (double)params.sampling.penalty_repeat),
         [](common_params & params, const std::string & value) {
             params.sampling.penalty_repeat = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1425,6 +1460,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "(default: %d, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)", params.sampling.mirostat),
         [](common_params & params, int value) {
             params.sampling.mirostat = value;
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1432,6 +1468,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("Mirostat learning rate, parameter eta (default: %.1f)", (double)params.sampling.mirostat_eta),
         [](common_params & params, const std::string & value) {
             params.sampling.mirostat_eta = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -1439,6 +1476,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("Mirostat target entropy, parameter tau (default: %.1f)", (double)params.sampling.mirostat_tau),
         [](common_params & params, const std::string & value) {
             params.sampling.mirostat_tau = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU;
         }
     ).set_sparam());
     add_opt(common_arg(
@@ -2072,11 +2110,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-m", "--model"}, "FNAME",
         ex == LLAMA_EXAMPLE_EXPORT_LORA
-            ? std::string("model path from which to load base model")
-            : string_format(
-                "model path (default: `models/$filename` with filename from `--hf-file` "
-                "or `--model-url` if set, otherwise %s)", DEFAULT_MODEL_PATH
-            ),
+            ? "model path from which to load base model"
+            : "model path to load",
         [](common_params & params, const std::string & value) {
             params.model.path = value;
         }
@@ -2468,6 +2503,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "path to save slot kv cache (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.slot_save_path = value;
+            if (!fs_is_directory(params.slot_save_path)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
             // if doesn't end with DIRECTORY_SEPARATOR, add it
             if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
                 params.slot_save_path += DIRECTORY_SEPARATOR;
@@ -2475,12 +2513,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--media-path"}, "PATH",
+        "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.media_path = value;
+            if (!fs_is_directory(params.media_path)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            // if doesn't end with DIRECTORY_SEPARATOR, add it
+            if (!params.media_path.empty() && params.media_path[params.media_path.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.media_path += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--models-dir"}, "PATH",
+        "directory containing models for the router server (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.models_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_DIR"));
+    add_opt(common_arg(
+        {"--models-max"}, "N",
+        string_format("for router server, maximum number of models to load simultaneously (default: %d, 0 = unlimited)", params.models_max),
+        [](common_params & params, int value) {
+            params.models_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
+    add_opt(common_arg(
+        {"--no-models-autoload"},
+        "disables automatic loading of models (default: enabled)",
+        [](common_params & params) {
+            params.models_autoload = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_NO_MODELS_AUTOLOAD"));
+    add_opt(common_arg(
         {"--jinja"},
-        "use jinja template for chat (default: disabled)",
+        string_format("use jinja template for chat (default: %s)\n", params.use_jinja ? "enabled" : "disabled"),
         [](common_params & params) {
             params.use_jinja = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
+    add_opt(common_arg(
+        {"--no-jinja"},
+        string_format("disable jinja template for chat (default: %s)\n", params.use_jinja ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.use_jinja = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_NO_JINJA"));
     add_opt(common_arg(
         {"--reasoning-format"}, "FORMAT",
         "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
@@ -2614,7 +2694,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params &, const std::string & value) {
             common_log_set_file(common_log_main(), value.c_str());
         }
-    ));
+    ).set_env("LLAMA_LOG_FILE"));
     add_opt(common_arg(
         {"--log-colors"}, "[on|off|auto]",
         "Set colored logging ('on', 'off', or 'auto', default: 'auto')\n"
@@ -2628,7 +2708,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 common_log_set_colors(common_log_main(), LOG_COLORS_AUTO);
             } else {
                 throw std::invalid_argument(
-                    string_format("error: unkown value for --log-colors: '%s'\n", value.c_str()));
+                    string_format("error: unknown value for --log-colors: '%s'\n", value.c_str()));
             }
         }
     ).set_env("LLAMA_LOG_COLORS"));
@@ -2649,7 +2729,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_OFFLINE"));
     add_opt(common_arg(
         {"-lv", "--verbosity", "--log-verbosity"}, "N",
-        "Set the verbosity threshold. Messages with a higher verbosity will be ignored.",
+        string_format("Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:\n"
+            " - 0: generic output\n"
+            " - 1: error\n"
+            " - 2: warning\n"
+            " - 3: info\n"
+            " - 4: debug\n"
+            "(default: %d)\n", params.verbosity),
         [](common_params & params, int value) {
             params.verbosity = value;
             common_log_set_verbosity_thold(value);
