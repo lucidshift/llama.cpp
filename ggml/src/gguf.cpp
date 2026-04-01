@@ -228,13 +228,41 @@ struct gguf_context {
 };
 
 struct gguf_reader {
-    FILE * file;
+    gguf_reader(FILE * file) : file(file) {
+        // read the remaining bytes once and update on each read
+        nbytes_remain = file_remain(file);
+    }
 
-    gguf_reader(FILE * file) : file(file) {}
+    // helper for remaining bytes in a file
+    static uint64_t file_remain(FILE * file) {
+        const int64_t cur = gguf_ftell(file);
+        if (cur < 0) {
+            return 0;
+        }
+        if (gguf_fseek(file, 0, SEEK_END) != 0) {
+            gguf_fseek(file, cur, SEEK_SET);
+
+            return 0;
+        }
+        const int64_t end = gguf_ftell(file);
+        if (end < 0) {
+            gguf_fseek(file, cur, SEEK_SET);
+
+            return 0;
+        }
+        gguf_fseek(file, cur, SEEK_SET);
+        return static_cast<uint64_t>(end - cur);
+    }
 
     template <typename T>
     bool read(T & dst) const {
-        return fread(&dst, 1, sizeof(dst), file) == sizeof(dst);
+        const size_t size = sizeof(dst);
+        if (nbytes_remain < size) {
+            return false;
+        }
+        const size_t nread = fread(&dst, 1, size, file);
+        nbytes_remain -= nread;
+        return nread == size;
     }
 
     template <typename T>
@@ -242,20 +270,19 @@ struct gguf_reader {
         if (n > GGUF_MAX_ARRAY_ELEMENTS) {
             return false;
         }
-        const uint64_t nbytes = nbytes_remain();
         if constexpr (std::is_same<T, std::string>::value) {
             // strings are prefixed with their length, so we need to account for that
             if (n > SIZE_MAX / sizeof(uint64_t)) {
                 return false;
             }
-            if (nbytes < n * sizeof(uint64_t)) {
+            if (nbytes_remain < n * sizeof(uint64_t)) {
                 return false;
             }
         } else {
             if (n > SIZE_MAX / sizeof(T)) {
                 return false;
             }
-            if (nbytes < n * sizeof(T)) {
+            if (nbytes_remain < n * sizeof(T)) {
                 return false;
             }
         }
@@ -312,39 +339,29 @@ struct gguf_reader {
             GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds maximum %" PRIu64 "\n", __func__, size, (uint64_t) GGUF_MAX_STRING_LENGTH);
             return false;
         }
-        const uint64_t nbytes = nbytes_remain();
-        if (size > nbytes) {
-            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds remaining file size %" PRIu64 " bytes\n", __func__, size, nbytes);
+        if (size > nbytes_remain) {
+            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds remaining file size %" PRIu64 " bytes\n", __func__, size, nbytes_remain);
             return false;
         }
         dst.resize(static_cast<size_t>(size));
-        return fread(dst.data(), 1, dst.length(), file) == dst.length();
+        const size_t nread = fread(dst.data(), 1, size, file);
+        nbytes_remain -= nread;
+        return nread == size;
     }
 
     bool read(void * dst, const size_t size) const {
-        return fread(dst, 1, size, file) == size;
+        if (size > nbytes_remain) {
+            return false;
+        }
+        const size_t nread = fread(dst, 1, size, file);
+        nbytes_remain -= nread;
+        return nread == size;
     }
 
-    // remaining bytes in the file
-    uint64_t nbytes_remain() const {
-        const int64_t cur = gguf_ftell(file);
-        if (cur < 0) {
-            return 0;
-        }
-        if (gguf_fseek(file, 0, SEEK_END) != 0) {
-            gguf_fseek(file, cur, SEEK_SET);
+private:
+    FILE * file;
 
-            return 0;
-        }
-        const int64_t end = gguf_ftell(file);
-        if (end < 0) {
-            gguf_fseek(file, cur, SEEK_SET);
-
-            return 0;
-        }
-        gguf_fseek(file, cur, SEEK_SET);
-        return static_cast<uint64_t>(end - cur);
-    }
+    mutable uint64_t nbytes_remain;
 };
 
 struct gguf_context * gguf_init_empty(void) {
@@ -377,7 +394,11 @@ bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct 
     return true;
 }
 
-struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_params params) {
+struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params) {
+    if (!file) {
+        return nullptr;
+    }
+
     const struct gguf_reader gr(file);
     struct gguf_context * ctx = new gguf_context;
 
@@ -831,7 +852,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
         return nullptr;
     }
 
-    struct gguf_context * result = gguf_init_from_file_impl(file, params);
+    struct gguf_context * result = gguf_init_from_file_ptr(file, params);
     fclose(file);
     return result;
 }
@@ -1491,6 +1512,19 @@ void gguf_write_to_buf(const struct gguf_context * ctx, std::vector<int8_t> & bu
     gguf_write_out(ctx, gw, only_meta);
 }
 
+bool gguf_write_to_file_ptr(const struct gguf_context * ctx, FILE * file, bool only_meta) {
+    GGML_ASSERT(file);
+
+    try {
+        gguf_writer_file gw(file);
+        gguf_write_out(ctx, gw, only_meta);
+    } catch (const std::runtime_error& ex) {
+        GGML_LOG_ERROR("%s: failed to write GGUF data: %s\n", __func__, ex.what());
+        return false;
+    }
+    return true;
+}
+
 bool gguf_write_to_file(const struct gguf_context * ctx, const char * fname, bool only_meta) {
     FILE * file = ggml_fopen(fname, "wb");
 
@@ -1499,17 +1533,13 @@ bool gguf_write_to_file(const struct gguf_context * ctx, const char * fname, boo
         return false;
     }
 
-    try {
-        gguf_writer_file gw(file);
-        gguf_write_out(ctx, gw, only_meta);
-    } catch (const std::runtime_error& ex) {
-        GGML_LOG_ERROR("%s: failed to write GGUF data into '%s': %s\n", __func__, fname, ex.what());
-        fclose(file);
-        return false;
+    const bool success = gguf_write_to_file_ptr(ctx, file, only_meta);
+    if (!success) {
+        GGML_LOG_ERROR("%s: failed to write GGUF data into '%s'\n", __func__, fname);
     }
 
     fclose(file);
-    return true;
+    return success;
 }
 
 size_t gguf_get_meta_size(const struct gguf_context * ctx) {
